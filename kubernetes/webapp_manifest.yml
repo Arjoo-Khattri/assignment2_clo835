@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: webapp-pod
+  labels:
+    app: employees
+spec:
+  containers:
+    - name: webapp
+      image: YOUR_ECR_IMAGE_URL
+      ports:
+        - containerPort: 80
