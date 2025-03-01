@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: ReplicaSet
 metadata:
   name: webapp-rs
+  namespace: webapp-ns
 spec:
   replicas: 3
   selector:
@@ -14,6 +15,19 @@ spec:
     spec:
       containers:
         - name: webapp
-          image: YOUR_ECR_IMAGE_URL
+          image: ${ECR_REGISTRY}/webapp-repo:v1.0
           ports:
-            - containerPort: 80
+            - containerPort: 8080
+          env:
+            - name: APP_COLOR
+              value: "blue"
+            - name: DBHOST
+              value: "mysql-service"
+            - name: DBPORT
+              value: "3306"
+            - name: DBUSER
+              value: "root"
+            - name: DBPWD
+              value: "my-secret-pw"
+            - name: DATABASE
+              value: "mydb"
