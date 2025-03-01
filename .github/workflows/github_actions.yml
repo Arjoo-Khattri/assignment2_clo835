@@ -1,10 +1,10 @@
-name: Deploy to ECR
+name: Build and Deploy to Kubernetes
 
-on: 
+on:
   pull_request:
     branches:
       - main
-    types: 
+    types:
       - closed
 
 jobs:
@@ -13,122 +13,137 @@ jobs:
     name: Build and Deploy
     runs-on: ubuntu-latest
     steps:
+      - name: Check out code
+        uses: actions/checkout@v4
 
-    - name: Check out code
-      uses: actions/checkout@v4
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_REGION: us-east-1
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        AWS_REGION: us-east-1
+      - name: Build, tag, and push images to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY_MYSQL: mysql-repo
+          ECR_REPOSITORY_WEBAPP: webapp-repo
+          IMAGE_TAG: v1.0
+        run: |
+          # Build images
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_MYSQL:$IMAGE_TAG -f Dockerfile_mysql .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$IMAGE_TAG -f Dockerfile .
 
-    - name: Build, tag, and push images to Amazon ECR
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY_MYSQL: mysql-repo
-        ECR_REPOSITORY_WEBAPP: webapp-repo
-        IMAGE_TAG: v1.0
-      run: |
-        # Build images
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_MYSQL:$IMAGE_TAG -f Dockerfile_mysql .
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$IMAGE_TAG -f Dockerfile .
+          # Push images to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_MYSQL:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$IMAGE_TAG
 
-        # Push images to ECR
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY_MYSQL:$IMAGE_TAG
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$IMAGE_TAG
+      - name: Setting up key file for SSH connection to EC2
+        run: |
+          echo "${{ secrets.SSH_KEY_FILE }}" > ./key_file.pem
+          chmod 400 ./key_file.pem
 
-    - name: Setting up key file for SSH connection to EC2
-      run: |
-        echo "${{ secrets.SSH_KEY_FILE }}" > ./key_file.pem
-        chmod 400 ./key_file.pem
+      - name: Update Kubernetes manifests with ECR registry
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          MANIFEST_FILES="k8s/*.yaml"
 
-    - name: Deploy to EC2 and Run Containers
-      run: |
-        echo "EC2 Public IP: ${{ secrets.EC2_INSTANCE_ID }}"
+          for file in $MANIFEST_FILES; do
+            sed -i "s|\${ECR_REGISTRY}|$ECR_REGISTRY|g" $file
+          done
 
-        # Add EC2 to known_hosts
-        mkdir -p ~/.ssh
-        ssh-keyscan -H ${{ secrets.EC2_INSTANCE_ID }} >> ~/.ssh/known_hosts
+      - name: Deploy to Kubernetes cluster on EC2
+        run: |
+          # SSH into EC2 instance and deploy to Kubernetes
+          ssh -i key_file.pem -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_INSTANCE_ID }} <<EOF
+            echo "Connected to EC2 successfully"
 
-        # SSH into EC2 instance and deploy
-        ssh -i key_file.pem -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_INSTANCE_ID }} <<EOF
-          echo "Connected to EC2 successfully"
+            mkdir -p ~/.aws
+            echo "[default]" > ~/.aws/credentials
+            echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> ~/.aws/credentials
+            echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> ~/.aws/credentials
+            echo "aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}" >> ~/.aws/credentials
+            echo "region=us-east-1" >> ~/.aws/credentials
+            chmod 600 ~/.aws/credentials
 
-          mkdir -p ~/.aws
-          echo "[default]" > ~/.aws/credentials
-          echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> ~/.aws/credentials
-          echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> ~/.aws/credentials
-          echo "aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}" >> ~/.aws/credentials
-          echo "region=us-east-1" >> ~/.aws/credentials
-          chmod 600 ~/.aws/credentials
+            # Login to AWS ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
+            
+            # Create temporary directory for manifests
+            mkdir -p ~/k8s-deploy
+            
+            # Make sure the kind cluster is running
+            kind get clusters || kind create cluster --name assignment2
+            
+            # Set KUBECONFIG
+            export KUBECONFIG=~/.kube/config
+          EOF
 
-          # Ensure Docker is installed
-          if ! command -v docker &> /dev/null
-          then
-            echo "Docker not found, installing now..."
-            sudo yum update -y
-            sudo yum install -y docker
-            sudo systemctl start docker
-            sudo systemctl enable docker
-            sudo usermod -aG docker ec2-user
-          else
-            echo "Docker is already installed"
-          fi
+          # Copy Kubernetes manifests to EC2
+          scp -i key_file.pem -o StrictHostKeyChecking=no k8s/*.yaml ec2-user@${{ secrets.EC2_INSTANCE_ID }}:~/k8s-deploy/
 
-          # Login to AWS ECR
-          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
+          # Apply Kubernetes manifests
+          ssh -i key_file.pem -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_INSTANCE_ID }} <<EOF
+            # Create namespaces first
+            kubectl apply -f ~/k8s-deploy/namespaces.yaml
+            
+            # Apply MySQL manifests
+            kubectl apply -f ~/k8s-deploy/mysql-pod.yaml
+            kubectl apply -f ~/k8s-deploy/mysql-replicaset.yaml
+            kubectl apply -f ~/k8s-deploy/mysql-deployment.yaml
+            kubectl apply -f ~/k8s-deploy/mysql-service.yaml
+            
+            # Apply Web application manifests
+            kubectl apply -f ~/k8s-deploy/webapp-pod.yaml
+            kubectl apply -f ~/k8s-deploy/webapp-replicaset.yaml
+            kubectl apply -f ~/k8s-deploy/webapp-deployment.yaml
+            kubectl apply -f ~/k8s-deploy/webapp-service.yaml
+            
+            # Verify deployments
+            echo "MySQL deployment:"
+            kubectl get pods -n mysql-ns
+            
+            echo "Web application deployment:"
+            kubectl get pods -n webapp-ns
+            
+            echo "Services:"
+            kubectl get svc -A | grep -E 'mysql|webapp'
+            
+            # Get NodePort access information
+            NODEPORT_IP=$(hostname -I | awk '{print $1}')
+            echo "Web application is accessible at: http://$NODEPORT_IP:30000"
+          EOF
 
-          # Remove Docker network only if it exists
-          if docker network inspect mynetwork >/dev/null 2>&1; then
-            docker network rm mynetwork
-          fi
-          
-          # Create Docker network
-          docker network create mynetwork || true
+      - name: Update Web Application (Version Rollout)
+        if: github.event.pull_request.merged == true && contains(github.event.pull_request.title, 'update-webapp')
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY_WEBAPP: webapp-repo
+          NEW_IMAGE_TAG: v2.0
+        run: |
+          # Build and push new version of webapp
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$NEW_IMAGE_TAG -f Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_WEBAPP:$NEW_IMAGE_TAG
 
-          # Pull latest images from ECR
-          docker pull ${{ steps.login-ecr.outputs.registry }}/mysql-repo:v1.0
-          docker pull ${{ steps.login-ecr.outputs.registry }}/webapp-repo:v1.0
+          # Update the deployment file with new image version
+          sed -i "s|v1.0|$NEW_IMAGE_TAG|g" k8s/updated-webapp-deployment.yaml
+          sed -i "s|\${ECR_REGISTRY}|$ECR_REGISTRY|g" k8s/updated-webapp-deployment.yaml
 
-          # Start MySQL container
-          docker run -d --name sql --network mynetwork \
-            -e MYSQL_ROOT_PASSWORD=my-secret-pw \
-            -e MYSQL_DATABASE=mydb \
-            -p 3306:3306 \
-            ${{ steps.login-ecr.outputs.registry }}/mysql-repo:v1.0
+          # Copy updated deployment file to EC2
+          scp -i key_file.pem -o StrictHostKeyChecking=no k8s/updated-webapp-deployment.yaml ec2-user@${{ secrets.EC2_INSTANCE_ID }}:~/k8s-deploy/
 
-          echo "Waiting for MySQL to initialize..."
-          sleep 30
-
-          # Start WebApp Containers
-          docker run -d --name blue-webapp --network mynetwork \
-            -e APP_COLOR=blue \
-            -e DBHOST=sql -e DBPORT=3306 \
-            -e DBUSER=root -e DBPWD=my-secret-pw \
-            -e DATABASE=mydb \
-            -p 8081:8080 \
-            ${{ steps.login-ecr.outputs.registry }}/webapp-repo:v1.0
-
-          docker run -d --name pink-webapp --network mynetwork \
-            -e APP_COLOR=pink \
-            -e DBHOST=sql -e DBPORT=3306 \
-            -e DBUSER=root -e DBPWD=my-secret-pw \
-            -e DATABASE=mydb \
-            -p 8082:8080 \
-            ${{ steps.login-ecr.outputs.registry }}/webapp-repo:v1.0
-
-          docker run -d --name lime-webapp --network mynetwork \
-            -e APP_COLOR=lime \
-            -e DBHOST=sql -e DBPORT=3306 \
-            -e DBUSER=root -e DBPWD=my-secret-pw \
-            -e DATABASE=mydb \
-            -p 8083:8080 \
-            ${{ steps.login-ecr.outputs.registry }}/webapp-repo:v1.0
-
-          echo "Running containers:"
-          docker ps
-        EOF
+          # Apply the updated deployment
+          ssh -i key_file.pem -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_INSTANCE_ID }} <<EOF
+            # Apply updated webapp deployment
+            kubectl apply -f ~/k8s-deploy/updated-webapp-deployment.yaml
+            
+            # Wait for rollout to complete
+            kubectl rollout status deployment/webapp-deployment -n webapp-ns
+            
+            # Verify new deployment
+            echo "Updated Web application deployment:"
+            kubectl get pods -n webapp-ns
+            kubectl describe deployment webapp-deployment -n webapp-ns | grep Image
+          EOF
