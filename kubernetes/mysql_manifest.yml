@@ -8,7 +8,7 @@ metadata:
 spec:
   containers:
     - name: mysql
-      image: ${ECR_REGISTRY}/mysql-repo:v1.0
+      image: 813634909417.dkr.ecr.us-east-1.amazonaws.com/mysql-repo:v1.0
       ports:
         - containerPort: 3306
       env:
