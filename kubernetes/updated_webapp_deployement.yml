@@ -20,14 +20,14 @@ spec:
     spec:
       containers:
         - name: webapp
-          image: 813634909417.dkr.ecr.us-east-1.amazonaws.com/webapp-repo:v2.0
+          image: webapp:v1
           ports:
             - containerPort: 8080
           env:
             - name: APP_COLOR
               value: "pink"
             - name: DBHOST
-              value: "mysql-service"
+              value: "mysql-service-svc-mysql-ns.local"
             - name: DBPORT
               value: "3306"
             - name: DBUSER
