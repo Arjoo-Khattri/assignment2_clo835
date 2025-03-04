@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: webapp
-          image: ${ECR_REGISTRY}/webapp-repo:v1.0
+          image: webapp:v1
           ports:
             - containerPort: 8080
           env:
