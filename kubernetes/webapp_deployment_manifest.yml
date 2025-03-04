@@ -27,7 +27,7 @@ spec:
             - name: APP_COLOR
               value: "blue"
             - name: DBHOST
-              value: "mysql-service"
+              value: "mysql-service-svc-mysql-ns.local"
             - name: DBPORT
               value: "3306"
             - name: DBUSER
